@@ -117,7 +117,7 @@ def lower_mobius_transform(freq):
   return result
 
 
-def can_cast_simple(cost, lands):
+def can_cast_simple(cost, lands, offset=0):
   """
   Given only simple lands that tap for one of a selection of colors. Determine
   if the cost can be met.
@@ -133,7 +133,7 @@ def can_cast_simple(cost, lands):
   land_g = lower_mobius_transform(lands)
   land_g[0] = 0 # Minor hack to let colorless lands be used to pay generic mana
   total_lands = land_g[ALL_COLORS_SET]
-  return all(c <= total_lands - g for c, g in zip(cost_g, land_g[::-1]))
+  return all(c + offset <= total_lands - g for c, g in zip(cost_g, land_g[::-1]))
 
 
 def can_cast(spell, lands, X=0):
@@ -216,37 +216,51 @@ def can_cast(spell, lands, X=0):
   total_cost = sum(cost.values())
 
   class SearchState:
-    def __init__(self, colors=None, colors_final=None, total=0, total_final=0, land_index=0):
-      if colors_final is None:
-        self.colors_final = tuple(0 for _ in range(len(COLORS)))
+    def __init__(self, colors=None, filter_colors=None, total=0, filter_total=0, filter_cost=0, land_index=0):
+      if filter_colors is None:
+        self.filter_colors = tuple(0 for _ in range(len(COLORS)))
       else:
-        self.colors_final = tuple(min(col, max_color) for col, max_color in zip(colors, max_colors))
+        self.filter_colors = tuple(min(col, max_color) for col, max_color in zip(filter_colors, max_colors))
 
       if colors is None:
         self.colors = tuple(0 for _ in range(len(COLORS)))
       else:
-        self.colors = tuple(min(col, max_color - col_final) for col, col_final, max_color in zip(colors, self.colors_final, max_colors))
+        self.colors = tuple(min(col, max_color - col_filter) for col, col_filter, max_color in zip(colors, self.filter_colors, max_colors))
 
-      self.total_final = min(total_final, total_cost)
-      self.total = min(total, total_cost - self.total_final)
+      self.filter_total = min(filter_total, total_cost)
+      self.total = total
+
+      self.filter_cost = filter_cost
       self.land_index = land_index
 
-      color_req = sum(max_colors) - sum(self.colors)
-      total_req = total_cost - self.total
-      self.huer_dist = (max(color_req, total_req) + land_index, color_req)
+      color_req = sum(max_colors) - sum(self.filter_colors) - sum(self.colors)
+      total_req = total_cost - self.filter_total - self.total
+      self.huer_dist = (max(color_req, total_req) + land_index + self.filter_cost, color_req, self.filter_total)
 
-    def add(self, *cols, land_weight=1, colorless=0):
+    def add(self, *cols, is_filtered=False, land_weight=1, colorless=0, filter_cost=0):
+      normal_cols, filter_cols = cols, ()
+      normal_total, filter_total = len(cols) + colorless, 0
+      if is_filtered:
+        normal_cols, filter_cols = filter_cols, normal_cols
+        normal_total, filter_total = filter_total, normal_total
+      
       return SearchState(
         colors=tuple(
-          cnt + sum(1 for col in cols if col == color)
+          cnt + sum(1 for col in normal_cols if col == color)
           for color, cnt in enumerate(self.colors)
         ),
-        total=self.total + len(cols) + colorless,
+        filter_colors=tuple(
+          cnt + sum(1 for col in filter_cols if col == color)
+          for color, cnt in enumerate(self.filter_colors)
+        ),
+        total=self.total + normal_total,
+        filter_total=self.filter_total + filter_total,
+        filter_cost=self.filter_cost + filter_cost,
         land_index=self.land_index + land_weight,
       )
 
     def _ident(self):
-      return (self.land_index, self.total, self.colors, self.colors_final)
+      return (self.land_index, self.total, self.filter_total, self.filter_cost, self.colors, self.filter_colors)
 
     def __eq__(self, obj):
       return self._ident() == obj._ident()
@@ -254,6 +268,7 @@ def can_cast(spell, lands, X=0):
     def __hash__(self):
       return hash(self._ident())
 
+  simple_land_count = sum(simple_lands.values())
   other_lands.sort(key=lambda card: card.name)
 
   visited_states = set()
@@ -270,14 +285,22 @@ def can_cast(spell, lands, X=0):
     state = queue.pop()
 
     # Test if we can solve from this state.
-    colored_mana = 0
+    colored_mana, colored_filter_mana = 0, 0
     state_lands = collections.Counter(simple_lands)
-    for col, cnt in enumerate(state.colors):
-      colored_mana += cnt
-      state_lands[2 ** col] += cnt
-    state_lands[0] += state.total - colored_mana
+    state_filter_lands = collections.Counter()
+    for col, (cnt, filter_cnt) in enumerate(zip(state.colors, state.filter_colors)):
+      state_lands[2 ** col] += cnt + filter_cnt
+      state_filter_lands[2 ** col] += filter_cnt
+      colored_mana += cnt + filter_cnt
+      colored_filter_mana += filter_cnt
+    state_lands[0] += state.filter_total + state.total - colored_mana
+    state_filter_lands[0] += state.filter_total - colored_filter_mana
 
-    if can_cast_simple(cost, state_lands):
+    # Verify for all color sets `s`
+    #  filtered_lands[s] >= colored_pips[s] + filter_cost - normal_lands
+    #  lands[s] >= colored_pips[s]
+    if can_cast_simple(cost, state_lands) and \
+       can_cast_simple(cost, state_filter_lands, offset=state.filter_cost - simple_land_count - state.total):
       return True
 
     # Test if we've already tried all the lands.
@@ -291,17 +314,16 @@ def can_cast(spell, lands, X=0):
       _try_queue(state.add(colorless=1))
       for color_a in range(len(COLORS)):
         for color_b in range(color_a):
-          _try_queue(state.add(color_a, color_b, colorless=-1))
+          _try_queue(state.add(color_a, color_b, is_filtered=True, filter_cost=1))
     elif land.land_type == LandTypes.LOTUS:
       for color in range(len(COLORS)):
         _try_queue(state.add(color, color, color))
     elif land.land_type == LandTypes.FILTERING:
       _try_queue(state.add(colorless=1))
       for color in range(len(COLORS)):
-        _try_queue(state.add(color, colorless=-1))
+        _try_queue(state.add(color, filter_cost=1))
 
   return False
-
 
 def _parse_cost(cost):
   if cost is None:
@@ -398,27 +420,10 @@ def read_format(fformat):
   }
 
 
-def main():
+def load_standard_cards():
   cards = {}
   with open("IKO.json", "r") as fset:
     cards.update(read_set(fset))
   with open("StandardCards.json", "r") as fformat:
     cards.update(read_format(fformat))
-  with open("decklist.mtg", "r") as fdeck:
-    decklist = Decklist(fdeck, cards)
-
-  print(
-    can_cast(
-      cards["Narset, Parter of Veils"],
-      [
-        cards["Interplanar Beacon"],
-        cards["Interplanar Beacon"],
-        cards["Interplanar Beacon"],
-        cards["Interplanar Beacon"],
-      ],
-    )
-  )
-
-
-if __name__ == "__main__":
-  main()
+  return cards
